@@ -41,6 +41,22 @@ public interface IUserRoleDao {
     throws AlreadyExistsException, UncategorizedUserRoleDaoException;
 
   /**
+   * Creates user under a specified tenant. If the tenant is null then it will create the user under a default
+   * tenant.
+   *
+   * @param tenant
+   * @param username
+   * @param password
+   * @param description
+   * @param roles
+   * @return pentaho user
+   * @throws AlreadyExistsException
+   * @throws UncategorizedUserRoleDaoException
+   */
+  IPentahoUser createOAuthUser( ITenant tenant, String username, String password, String description, String[] roles, String registrationId, String userId )
+          throws AlreadyExistsException, UncategorizedUserRoleDaoException;
+
+  /**
    * Update the password of an existing user under a specified tenant. If the tenant is null then it will try to
    * update the password of an existing user under a default tenant
    * 
@@ -86,6 +102,8 @@ public interface IUserRoleDao {
    */
   IPentahoUser getUser( ITenant tenant, String name ) throws UncategorizedUserRoleDaoException;
 
+  IPentahoUser getPentahoOAuthUser( ITenant tenant, String name ) throws UncategorizedUserRoleDaoException;
+
   /**
    * Retrieve all the users from the default tenant of a repository.
    * 
@@ -93,6 +111,14 @@ public interface IUserRoleDao {
    * @throws UncategorizedUserRoleDaoException
    */
   List<IPentahoUser> getUsers() throws UncategorizedUserRoleDaoException;
+
+  /**
+   * Retrieve all the OAuth users from the default tenant of a repository.
+   *
+   * @return list of pentaho user
+   * @throws UncategorizedUserRoleDaoException
+   */
+  List<IPentahoUser> getAllOAuthUsers() throws UncategorizedUserRoleDaoException;
 
   /**
    * Retrieve all the users from the specified tenant of a repository. If the tenant is null then it will try to

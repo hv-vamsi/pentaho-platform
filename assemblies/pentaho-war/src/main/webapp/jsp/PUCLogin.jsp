@@ -24,6 +24,7 @@
             org.pentaho.platform.util.messages.LocaleHelper,
             org.pentaho.platform.api.engine.IPentahoSession,
             org.pentaho.platform.api.engine.IPluginManager,
+            org.pentaho.platform.plugin.services.security.userrole.oauth.PentahoOAuthUtility,
             org.pentaho.platform.web.jsp.messages.Messages,
             java.util.ArrayList,
             java.util.Iterator,
@@ -85,6 +86,8 @@
   int year = (new java.util.Date()).getYear() + 1900;
 
   boolean showUsers = Boolean.parseBoolean(PentahoSystem.getSystemSetting("login-show-sample-users-hint", "true"));
+
+  boolean isProviderOAuth = PentahoOAuthUtility.isOAuthEnabled();
 %>
 <%!
   public boolean isUserBlocked(HttpSession session) {
@@ -217,6 +220,13 @@
         <div id="login-form-container" class="lang_<%=cleanedLang%>">
           <div id="animate-wrapper">
             <h1><%=Messages.getInstance().getString("UI.PUC.LOGIN.TITLE")%></h1>
+            <%
+              if (isProviderOAuth) {
+            %>
+            <button style="margin-left:70px;margin-top:150px;" onClick="redirectToOAuth()" id="microsoft-auth-button" class="css-1bthe7p" tabindex="0" type="button"><span class="css-1ti50tg"><img src="https://id-frontend.prod-east.frontend.public.atl-paas.net/assets/microsoft-logo.c73d8dca.svg" alt=""></span><span class="css-178ag6o">&nbsp;&nbsp;Sign-in with Microsoft</span></button>
+            <%
+              } else {
+            %>
             <form name="login" id="login" action="j_spring_security_check" method="POST">
               <div class="row-fluid nowrap">
                 <div class="space-10"></div>
@@ -256,6 +266,9 @@
                 %>
               </div>
             </form>
+            <%
+              }
+            %>
           </div>
 
           <div class="row-fluid">
@@ -300,6 +313,10 @@
 </div>
 
 <script type="text/javascript">
+
+  function redirectToOAuth() {
+    window.location.href = window.location.href.replace("Login", "oauth2/authorization/azure");
+  }
 
   <%
   if (showUsers) {

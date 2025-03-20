@@ -147,6 +147,29 @@ public class JcrUserRoleDao extends AbstractJcrBackedUserRoleDao {
   }
 
   @Override
+  public IPentahoUser createOAuthUser( final ITenant tenant, final String userName, final String password,
+                                  final String description, final String[] roles, String registrationId, String userId ) throws AlreadyExistsException,
+          UncategorizedUserRoleDaoException {
+    final IPentahoUser user;
+    try {
+      user = (IPentahoUser) adminJcrTemplate.execute( new JcrCallback() {
+        @Override
+        public Object doInJcr( Session session ) throws IOException, RepositoryException {
+          return createOAuthUser( session, tenant, userName, password, description, roles, registrationId, userId );
+        }
+      } );
+    } catch ( DataAccessException e ) {
+      if ( ( e instanceof JcrSystemException ) && ( e.getCause() instanceof AuthorizableExistsException ) ) {
+        throw new AlreadyExistsException( Messages.getInstance().getString(
+                "JcrUserRoleDao.User.Already.Exists" ) );
+      }
+      throw new UncategorizedUserRoleDaoException( Messages.getInstance().getString(
+              "JcrUserRoleDao.ERROR_0003_CREATING_USER", e.getLocalizedMessage() ), e );
+    }
+    return user;
+  }
+
+  @Override
   public void deleteRole( final IPentahoRole role ) throws NotFoundException, UncategorizedUserRoleDaoException {
     try {
       adminJcrTemplate.execute( new JcrCallback() {
@@ -297,6 +320,25 @@ public class JcrUserRoleDao extends AbstractJcrBackedUserRoleDao {
   }
 
   @Override
+  public List<IPentahoUser> getAllOAuthUsers() throws UncategorizedUserRoleDaoException {
+    boolean allowCreateBackup = adminJcrTemplate.isAllowCreate();
+    try {
+      adminJcrTemplate.setAllowCreate( true );
+      return (List<IPentahoUser>) adminJcrTemplate.execute( new JcrCallback() {
+        @Override
+        public Object doInJcr( Session session ) throws RepositoryException {
+          return getAllOAuthUsers( session, JcrTenantUtils.getTenant(), true );
+        }
+      } );
+    } catch ( DataAccessException e ) {
+      throw new UncategorizedUserRoleDaoException( Messages.getInstance().getString(
+              "JcrUserRoleDao.ERROR_0009_LISTING_USERS", e.getLocalizedMessage() ), e );
+    } finally {
+      adminJcrTemplate.setAllowCreate( allowCreateBackup );
+    }
+  }
+
+  @Override
   public IPentahoRole getRole( final ITenant tenant, final String name ) throws UncategorizedUserRoleDaoException {
     try {
       return (IPentahoRole) adminJcrTemplate.execute( new JcrCallback() {
@@ -323,6 +365,21 @@ public class JcrUserRoleDao extends AbstractJcrBackedUserRoleDao {
     } catch ( DataAccessException e ) {
       throw new UncategorizedUserRoleDaoException( Messages.getInstance().getString(
           "JcrUserRoleDao.ERROR_0010_GETTING_ROLE", e.getLocalizedMessage() ), e );
+    }
+  }
+
+  @Override
+  public IPentahoUser getPentahoOAuthUser( final ITenant tenant, final String name ) throws UncategorizedUserRoleDaoException {
+    try {
+      return (IPentahoUser) adminJcrTemplate.execute( new JcrCallback() {
+        @Override
+        public Object doInJcr( Session session ) throws IOException, RepositoryException {
+          return getPentahoOAuthUser( session, tenant, name );
+        }
+      } );
+    } catch ( DataAccessException e ) {
+      throw new UncategorizedUserRoleDaoException( Messages.getInstance().getString(
+              "JcrUserRoleDao.ERROR_0010_GETTING_ROLE", e.getLocalizedMessage() ), e );
     }
   }
 
