@@ -35,6 +35,7 @@ import jakarta.servlet.ServletResponse;
 import jakarta.servlet.SessionCookieConfig;
 import jakarta.servlet.http.Cookie;
 import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletRequestWrapper;
 import jakarta.servlet.http.HttpServletResponse;
 import jakarta.servlet.http.HttpServletResponseWrapper;
 import jakarta.servlet.http.HttpSession;
@@ -143,6 +144,13 @@ public class HttpSessionPentahoSessionIntegrationFilter implements Filter, Initi
 
   private boolean ssoEnabled = false;
 
+  /**
+   * Cached value of the {@code jwt-enabled} system setting from {@code pentaho.xml}.
+   * Lazily resolved on the first request via {@link #isJwtModeEnabled()}.
+   * {@code null} means "not yet resolved".
+   */
+  private volatile Boolean jwtModeEnabled = null;
+
   // ~ Methods ========================================================================================================
 
   /**
@@ -230,6 +238,78 @@ public class HttpSessionPentahoSessionIntegrationFilter implements Filter, Initi
 
     HttpServletRequest httpRequest = (HttpServletRequest) request;
     HttpServletResponse httpResponse = (HttpServletResponse) response;
+
+    // ---------- JWT / Stateless mode ----------
+    // When jwtModeEnabled is true the server uses JWT tokens as the primary
+    // authentication mechanism. ALL requests — with or without a Bearer header —
+    // bypass HttpSession-based Pentaho session management.
+    //
+    // Requests WITH a Bearer header: JwtBearerAuthenticationFilter downstream
+    // handles PentahoSession and SecurityContext.
+    //
+    // Requests WITHOUT a Bearer header (e.g. static JS/CSS, ES-module imports):
+    // receive a lightweight anonymous PentahoSession, no HttpSession is persisted,
+    // and JSESSIONID cookies are suppressed.
+    //
+    // Even when jwtModeEnabled is false, a per-request Bearer check is kept so
+    // that individual JWT requests still get stateless treatment.
+    String authHeader = httpRequest.getHeader( "Authorization" );
+    boolean isBearerRequest = authHeader != null && authHeader.startsWith( "Bearer " );
+
+    if ( isBearerRequest || isJwtModeEnabled() ) {
+      if ( logger.isDebugEnabled() ) {
+        logger.debug( isBearerRequest
+          ? "JWT Bearer request — skipping HttpSession-based Pentaho session integration"
+          : "JWT mode active (no Bearer) — using lightweight session, suppressing JSESSIONID" );
+      }
+
+      // Wrap the response to suppress session-related cookies set via the Servlet API,
+      // AND wrap the request to prevent getSession(true) from creating new sessions.
+      // The request wrapper is critical: Tomcat's Response.addSessionCookieInternal()
+      // bypasses all response wrappers, writing JSESSIONID directly to the Coyote
+      // buffer. The ONLY way to stop it is to prevent session creation entirely.
+      HttpServletResponse statelessResponse = wrapResponseForJwt( httpResponse );
+      HttpServletRequest statelessRequest = wrapRequestForJwt( httpRequest );
+
+      // Eagerly send delete cookies BEFORE chain.doFilter() — the response may be
+      // committed by the time the chain finishes, making it too late to add headers.
+      // This clears any stale JSESSIONID / session-flushed / session-expiry cookies
+      // that the browser is still sending from a previous (pre-JWT) session.
+      clearJSessionIdCookie( httpRequest, httpResponse );
+
+      localeLeftovers( httpRequest );
+
+      if ( isBearerRequest ) {
+        // Bearer token present — JwtBearerAuthenticationFilter downstream handles everything.
+        try {
+          chain.doFilter( statelessRequest, statelessResponse );
+        } finally {
+          localeReset();
+        }
+      } else {
+        // No Bearer token: static resource / module load.  Set an anonymous PentahoSession
+        // so downstream components that access PentahoSessionHolder do not NPE.
+        // The name MUST be non-null: Jackrabbit's UserRoleDao → TenantUtils.getCurrentTenant()
+        // calls DefaultTenantedPrincipleNameResolver.getTenant(session.getName()), which
+        // throws NPE on a null principalId.
+        IPentahoSession lightSession = new NoDestroyStandaloneSession( getAnonymousUser() );
+        if ( callSetAuthenticatedForAnonymousUsers ) {
+          lightSession.setAuthenticated( getAnonymousUser() );
+        }
+        ITempFileDeleter deleter = PentahoSystem.get( ITempFileDeleter.class, lightSession );
+        if ( deleter != null ) {
+          lightSession.setAttribute( ITempFileDeleter.DELETER_SESSION_VARIABLE, deleter );
+        }
+        try {
+          PentahoSessionHolder.setSession( lightSession );
+          chain.doFilter( statelessRequest, statelessResponse );
+        } finally {
+          PentahoSessionHolder.removeSession();
+          localeReset();
+        }
+      }
+      return;
+    }
 
     if ( httpRequest.getAttribute( FILTER_APPLIED ) != null ) {
       // ensure that filter is only applied once per request
@@ -378,7 +458,12 @@ public class HttpSessionPentahoSessionIntegrationFilter implements Filter, Initi
               + "(because the allowSessionCreation property is false) - Pentaho session thus not "
               + "stored for next request" );
           }
-        } else if ( pentahoSession != null ) {
+        } else if ( pentahoSession != null && !( pentahoSession instanceof NoDestroyStandaloneSession ) ) {
+          // Only create an HttpSession (JSESSIONID) when there is a meaningful Pentaho
+          // session — i.e. NOT the temporary anonymous-only NoDestroyStandaloneSession
+          // that is generated when no prior session exists. Skipping creation for that
+          // case prevents spurious JSESSIONID cookies for anonymous requests that occur
+          // after a JWT-based login (e.g. <script src> loads after document.write).
           if ( logger.isDebugEnabled() ) {
             logger.debug( "HttpSession being created as Pentaho session is non-null" );
           }
@@ -525,6 +610,202 @@ public class HttpSessionPentahoSessionIntegrationFilter implements Filter, Initi
 
   public void setSsoEnabled( boolean ssoEnabled ) {
     this.ssoEnabled = ssoEnabled;
+  }
+
+  /**
+   * Returns whether JWT stateless authentication is the primary authentication mode.
+   * The value is lazily resolved from the {@code jwt-enabled} system setting in {@code pentaho.xml}
+   * (same setting used by {@code LoginSystemSettingsService}).
+   * <p>
+   * When {@code true}, <strong>all</strong> requests bypass {@code HttpSession}-based Pentaho session
+   * management, suppress {@code JSESSIONID} cookies, and use lightweight in-memory sessions.
+   *
+   * @return {@code true} if JWT mode is active (default {@code true} when the setting is absent)
+   */
+  public boolean isJwtModeEnabled() {
+    if ( jwtModeEnabled == null ) {
+      String setting = PentahoSystem.getSystemSetting( "jwt-enabled", "true" );
+      jwtModeEnabled = Boolean.parseBoolean( setting );
+      if ( logger.isDebugEnabled() ) {
+        logger.debug( "jwt-enabled system setting resolved to: " + jwtModeEnabled );
+      }
+    }
+    return jwtModeEnabled;
+  }
+
+
+  /**
+   * Wraps the response to suppress {@code JSESSIONID} and {@code session-flushed} cookie headers
+   * set via the Servlet API ({@code addCookie}, {@code addHeader}, {@code setHeader}).
+   * <p>
+   * <strong>Note:</strong> Tomcat's internal session cookie mechanism
+   * ({@code Response.addSessionCookieInternal}) writes directly to the Catalina {@code Response}
+   * object, bypassing any {@code HttpServletResponseWrapper}. Use {@link #wrapRequestForJwt}
+   * to prevent session creation at the source, which is the only reliable way to stop
+   * Tomcat from writing JSESSIONID cookies.
+   */
+  private HttpServletResponse wrapResponseForJwt( HttpServletResponse response ) {
+    return new HttpServletResponseWrapper( response ) {
+      @Override
+      public void addCookie( Cookie cookie ) {
+        String name = cookie.getName();
+        if ( "JSESSIONID".equalsIgnoreCase( name )
+            || "session-flushed".equalsIgnoreCase( name )
+            || "session-expiry".equalsIgnoreCase( name )
+            || "server-time".equalsIgnoreCase( name ) ) {
+          return;
+        }
+        super.addCookie( cookie );
+      }
+
+      @Override
+      public void addHeader( String name, String value ) {
+        if ( "Set-Cookie".equalsIgnoreCase( name ) && value != null
+            && ( value.contains( "JSESSIONID" ) || value.contains( "session-flushed" )
+                 || value.contains( "session-expiry" ) || value.contains( "server-time" ) ) ) {
+          return;
+        }
+        super.addHeader( name, value );
+      }
+
+      @Override
+      public void setHeader( String name, String value ) {
+        if ( "Set-Cookie".equalsIgnoreCase( name ) && value != null
+            && ( value.contains( "JSESSIONID" ) || value.contains( "session-flushed" )
+                 || value.contains( "session-expiry" ) || value.contains( "server-time" ) ) ) {
+          return;
+        }
+        super.setHeader( name, value );
+      }
+
+      // Tomcat's encodeRedirectURL() calls request.getSessionInternal(true) on the
+      // internal Catalina Request (completely bypassing any HttpServletRequestWrapper),
+      // which creates a new HttpSession and sets JSESSIONID. Returning the URL unchanged
+      // prevents this session-creation path.
+      @Override
+      public String encodeRedirectURL( String url ) {
+        return url;
+      }
+
+      @Override
+      public String encodeURL( String url ) {
+        return url;
+      }
+    };
+  }
+
+  /**
+   * Wraps the request to prevent any downstream code from creating a new {@code HttpSession}.
+   * <p>
+   * This is the <strong>only reliable way</strong> to prevent Tomcat from setting
+   * {@code JSESSIONID} cookies. Tomcat's {@code Response.addSessionCookieInternal()} writes
+   * the cookie directly to the Coyote response buffer, completely bypassing any
+   * {@code HttpServletResponseWrapper}. The only way to stop it is to ensure no new
+   * {@code HttpSession} is ever created — which means intercepting {@code getSession(true)}
+   * and {@code getSession()} at the request level.
+   * <p>
+   * In JWT mode no code should depend on {@code HttpSession}. If an existing session is
+   * already present (e.g. from a prior non-JWT login), it is still returned — only
+   * <em>creation</em> of new sessions is blocked.
+   */
+  private HttpServletRequest wrapRequestForJwt( HttpServletRequest request ) {
+    return new HttpServletRequestWrapper( request ) {
+      @Override
+      public HttpSession getSession( boolean create ) {
+        if ( create ) {
+          // Return existing session if available, but NEVER create a new one.
+          return super.getSession( false );
+        }
+        return super.getSession( false );
+      }
+
+      @Override
+      public HttpSession getSession() {
+        // Default getSession() behaves like getSession(true) — override to never create.
+        return super.getSession( false );
+      }
+    };
+  }
+
+  /**
+   * Adds {@code Set-Cookie} headers that instruct the browser to <em>delete</em> any
+   * {@code JSESSIONID}, {@code session-flushed}, {@code session-expiry}, and
+   * {@code server-time} cookies — but <strong>only</strong> if the browser is actually
+   * sending those cookies. This avoids polluting every JWT response with unnecessary
+   * {@code Set-Cookie} headers once the browser has already cleared its stale cookies.
+   * <p>
+   * The header is added on the <strong>original</strong> (unwrapped) {@code HttpServletResponse}
+   * so that even if a wrapper suppresses normal cookie writes, this one still reaches the client.
+   */
+  private void clearJSessionIdCookie( HttpServletRequest request, HttpServletResponse response ) {
+    if ( response.isCommitted() ) {
+      return;
+    }
+
+    Cookie[] browserCookies = request.getCookies();
+    if ( browserCookies == null || browserCookies.length == 0 ) {
+      // Browser sent no cookies — nothing to clear.
+      return;
+    }
+
+    // Build a set of cookie names the browser is sending.
+    java.util.Set<String> presentNames = new java.util.HashSet<>();
+    for ( Cookie c : browserCookies ) {
+      presentNames.add( c.getName() );
+    }
+
+    // If the browser isn't sending any of the cookies we want to clear, skip entirely.
+    if ( !presentNames.contains( "JSESSIONID" )
+        && !presentNames.contains( "session-flushed" )
+        && !presentNames.contains( "session-expiry" )
+        && !presentNames.contains( "server-time" ) ) {
+      return;
+    }
+
+    String contextPath = request.getContextPath();
+    if ( contextPath == null || contextPath.isEmpty() ) {
+      contextPath = "/";
+    }
+
+    // Clear JSESSIONID on the context path
+    if ( presentNames.contains( "JSESSIONID" ) ) {
+      Cookie clear = new Cookie( "JSESSIONID", "" );
+      clear.setMaxAge( 0 );
+      clear.setPath( contextPath );
+      response.addCookie( clear );
+
+      // Also clear for root path — browsers may hold duplicate JSESSIONID cookies on "/"
+      if ( !"/".equals( contextPath ) ) {
+        Cookie rootClear = new Cookie( "JSESSIONID", "" );
+        rootClear.setMaxAge( 0 );
+        rootClear.setPath( "/" );
+        response.addCookie( rootClear );
+      }
+    }
+
+    // Clear session-flushed cookie (set by PentahoBasicProcessingFilter)
+    if ( presentNames.contains( "session-flushed" ) ) {
+      Cookie sessionFlushed = new Cookie( "session-flushed", "" );
+      sessionFlushed.setMaxAge( 0 );
+      sessionFlushed.setPath( contextPath );
+      response.addCookie( sessionFlushed );
+    }
+
+    // Clear session-expiry cookie (set by setSessionExpirationCookies)
+    if ( presentNames.contains( "session-expiry" ) ) {
+      Cookie sessionExpiry = new Cookie( "session-expiry", "" );
+      sessionExpiry.setMaxAge( 0 );
+      sessionExpiry.setPath( contextPath );
+      response.addCookie( sessionExpiry );
+    }
+
+    // Clear server-time cookie (set by setSessionExpirationCookies)
+    if ( presentNames.contains( "server-time" ) ) {
+      Cookie serverTime = new Cookie( "server-time", "" );
+      serverTime.setMaxAge( 0 );
+      serverTime.setPath( contextPath );
+      response.addCookie( serverTime );
+    }
   }
 
   // ~ Inner Classes ==================================================================================================

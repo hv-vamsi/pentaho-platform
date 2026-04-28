@@ -110,6 +110,16 @@ public class RequestParameterAuthenticationFilter implements Filter, Initializin
 
   public void doFilter( final ServletRequest request, final ServletResponse response, final FilterChain chain )
     throws IOException, ServletException {
+
+    // JWT-authenticated requests use Bearer tokens — skip request parameter auth entirely.
+    if ( request instanceof HttpServletRequest ) {
+      String authHeader = ( (HttpServletRequest) request ).getHeader( "Authorization" );
+      if ( authHeader != null && authHeader.startsWith( "Bearer " ) ) {
+        chain.doFilter( request, response );
+        return;
+      }
+    }
+
     IConfiguration config = this.systemConfig.getConfiguration( "security" );
 
     if ( !isRequestAuthenticationParameterLoaded ) {

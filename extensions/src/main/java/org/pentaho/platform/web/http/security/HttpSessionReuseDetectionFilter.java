@@ -88,6 +88,13 @@ public class HttpSessionReuseDetectionFilter implements Filter, InitializingBean
     HttpServletRequest httpRequest = (HttpServletRequest) request;
     HttpServletResponse httpResponse = (HttpServletResponse) response;
 
+    // JWT-authenticated requests are stateless and have no session to reuse — skip detection.
+    String authHeader = httpRequest.getHeader( "Authorization" );
+    if ( authHeader != null && authHeader.startsWith( "Bearer " ) ) {
+      chain.doFilter( request, response );
+      return;
+    }
+
     if ( requiresAuthentication( httpRequest, httpResponse ) ) {
       if ( HttpSessionReuseDetectionFilter.logger.isDebugEnabled() ) {
         HttpSessionReuseDetectionFilter.logger.debug( Messages.getInstance().getString(

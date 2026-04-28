@@ -15,6 +15,9 @@ package org.pentaho.platform.web.http.security;
 
 import com.google.common.annotations.VisibleForTesting;
 import edu.umd.cs.findbugs.annotations.NonNull;
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
+import org.pentaho.platform.engine.core.system.PentahoSystem;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.context.ApplicationEventPublisherAware;
 import org.springframework.security.authentication.AuthenticationManager;
@@ -50,6 +53,8 @@ import java.util.Arrays;
  */
 public class PentahoBasicProcessingFilter extends BasicAuthenticationFilter implements ApplicationEventPublisherAware {
 
+  private static final Log logger = LogFactory.getLog( PentahoBasicProcessingFilter.class );
+
   @VisibleForTesting
   static final String SESSION_FLUSHED_COOKIE_NAME = "session-flushed";
 
@@ -58,6 +63,13 @@ public class PentahoBasicProcessingFilter extends BasicAuthenticationFilter impl
 
 
   private ApplicationEventPublisher applicationEventPublisher;
+
+  /**
+   * Cached value of the {@code jwt-enabled} system setting from {@code pentaho.xml}.
+   * Lazily resolved on the first request via {@link #isJwtModeEnabled()}.
+   * {@code null} means "not yet resolved".
+   */
+  private volatile Boolean jwtModeEnabled = null;
 
   public PentahoBasicProcessingFilter( AuthenticationManager authenticationManager,
                                        AuthenticationEntryPoint authenticationEntryPoint ) {
@@ -71,6 +83,22 @@ public class PentahoBasicProcessingFilter extends BasicAuthenticationFilter impl
   @Override
   public void doFilterInternal( HttpServletRequest request, HttpServletResponse response, FilterChain chain )
     throws IOException, ServletException {
+
+    // If the request already carries a Bearer token (JWT), skip Basic-Auth processing entirely.
+    // JWT requests are stateless and should not interact with session/cookie-based logic.
+    String authHeader = request.getHeader( "Authorization" );
+    if ( authHeader != null && authHeader.startsWith( "Bearer " ) ) {
+      chain.doFilter( request, response );
+      return;
+    }
+
+    // In JWT mode ALL requests are stateless — there are no HttpSessions, so the
+    // session-flushed detection logic (expired JSESSIONID → force re-auth) is irrelevant.
+    // Skip directly to Basic-Auth processing without any session/cookie side-effects.
+    if ( isJwtModeEnabled() ) {
+      doFilterInternalSuper( request, response, chain );
+      return;
+    }
 
     if ( request.getRequestedSessionId() != null && !request.isRequestedSessionIdValid() ) {
       // Expired session detected.
@@ -120,7 +148,13 @@ public class PentahoBasicProcessingFilter extends BasicAuthenticationFilter impl
   protected void onSuccessfulAuthentication( HttpServletRequest request, HttpServletResponse response,
                                              Authentication authResult ) throws IOException {
     super.onSuccessfulAuthentication( request, response, authResult );
-    request.getSession().setAttribute( "BasicAuth", "true" );
+
+    // In JWT mode, do NOT touch HttpSession — sessions are not used and calling
+    // request.getSession() would trigger Tomcat to create one (and set JSESSIONID).
+    if ( !isJwtModeEnabled() ) {
+      request.getSession().setAttribute( "BasicAuth", "true" );
+    }
+
     if ( applicationEventPublisher != null ) {
       applicationEventPublisher.publishEvent( new AuthenticationSuccessEvent( authResult ) );
     }
@@ -165,5 +199,21 @@ public class PentahoBasicProcessingFilter extends BasicAuthenticationFilter impl
     }
 
     return false;
+  }
+
+  /**
+   * Returns whether JWT stateless authentication is the primary authentication mode.
+   * When {@code true}, session-flushed cookie logic and HttpSession creation are skipped.
+   */
+  @VisibleForTesting
+  boolean isJwtModeEnabled() {
+    if ( jwtModeEnabled == null ) {
+      String setting = PentahoSystem.getSystemSetting( "jwt-enabled", "true" );
+      jwtModeEnabled = Boolean.parseBoolean( setting );
+      if ( logger.isDebugEnabled() ) {
+        logger.debug( "jwt-enabled system setting resolved to: " + jwtModeEnabled );
+      }
+    }
+    return jwtModeEnabled;
   }
 }

@@ -16,7 +16,7 @@
 --%>
 
 <%@ taglib prefix='c' uri='http://java.sun.com/jstl/core'%>
-<%@ page language="java"
+<%@ page session="false" language="java"
     import="
             org.pentaho.platform.engine.core.system.PentahoSystem,
             org.pentaho.platform.api.engine.IPentahoSession,

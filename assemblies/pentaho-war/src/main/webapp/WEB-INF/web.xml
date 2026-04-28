@@ -309,7 +309,19 @@
 
   <servlet>
     <servlet-name>Login</servlet-name>
-    <jsp-file>/jsp/PUCLogin.jsp</jsp-file>
+    <servlet-class>com.pentaho.ui.servlet.LoginRedirectServlet</servlet-class>
+    <init-param>
+      <param-name>redirectUrl</param-name>
+      <param-value>/content/login/web/index.html</param-value>
+    </init-param>
+    <init-param>
+      <param-name>default401Pattern</param-name>
+      <param-value>AdhocWebService</param-value>
+    </init-param>
+    <init-param>
+      <param-name>jspFile</param-name>
+      <param-value>/jsp/PUCLogin.jsp</param-value>
+    </init-param>
     <init-param>
       <param-name>send401List</param-name>
       <param-value>ServiceActionService,gwtrpc,ws/gwt,mantle/images/spacer.gif</param-value>
@@ -530,8 +542,12 @@
 
   <!-- insert additional servlet mappings -->
   <session-config>
-    <tracking-mode>COOKIE</tracking-mode>
     <session-timeout>120</session-timeout>
+    <!-- URL tracking mode prevents Tomcat from setting JSESSIONID cookies.
+         In JWT mode, the response wrapper also suppresses URL rewriting
+         (encodeURL/encodeRedirectURL return URLs unchanged), so no session
+         tracking artifacts appear in responses at all. -->
+    <tracking-mode>URL</tracking-mode>
   </session-config>
 
   <mime-mapping>
